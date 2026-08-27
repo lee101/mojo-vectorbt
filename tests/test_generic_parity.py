@@ -107,6 +107,18 @@ def test_noncontiguous_and_integer_inputs_are_safely_normalized():
     assert np.allclose(actual, expected, equal_nan=True)
 
 
+@pytest.mark.parametrize("rows", [124_999, 125_000])
+def test_rolling_simd_parallel_threshold_matches_vectorbt(rows):
+    rng = np.random.default_rng(rows)
+    values = np.ascontiguousarray(rng.normal(size=(rows, 8)))
+    values[::997, 3] = np.nan
+    actual = mojo_nb.rolling_mean_nb(values, 31, 7)
+    expected = vbt.generic.nb.rolling_mean_nb(values, 31, 7)
+    assert np.allclose(
+        actual, expected, equal_nan=True, rtol=1e-12, atol=1e-12
+    )
+
+
 def test_unsafe_float64_narrowing_is_rejected():
     with pytest.raises(ValueError, match="exact float64 range"):
         mojo_nb.diff_1d_nb(np.array([2**60], dtype=np.int64))

@@ -1,11 +1,15 @@
 """Vectorized backtesting kernels exposed through a C ABI."""
 
+from max.algorithm import parallelize
 from std.math import floor, isnan, sqrt
 from std.sys.info import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime PARALLEL_ROLLING_WORK = 1_000_000
+comptime PARALLEL_QUANTILE_ROWS = 8192
+comptime PARALLEL_COLUMN_WORK = 1_000_000
 
 
 def fp(addr: Int) -> FPtr:
@@ -63,6 +67,89 @@ def shift_transform(
                 dst[k] = values[k] / values[(i - n) * cols + col] - 1.0
 
 
+def rolling_moments_scalar(
+    values: FPtr,
+    dst: FPtr,
+    rows: Int,
+    cols: Int,
+    col: Int,
+    window: Int,
+    minp: Int,
+    ddof: Int,
+    take_std: Bool,
+):
+    var total = 0.0
+    var total_sq = 0.0
+    var valid = 0
+    for i in range(rows):
+        var value = values[i * cols + col]
+        if not isnan(value):
+            valid += 1
+            total += value
+            total_sq += value * value
+        if i >= window:
+            var old = values[(i - window) * cols + col]
+            if not isnan(old):
+                total -= old
+                total_sq -= old * old
+                valid -= 1
+        var k = i * cols + col
+        if valid < minp:
+            dst[k] = nan_value()
+        elif not take_std:
+            dst[k] = total / Float64(valid)
+        elif valid <= ddof:
+            dst[k] = nan_value()
+        else:
+            var mean = total / Float64(valid)
+            var centered = total_sq - 2.0 * total * mean + Float64(valid) * mean * mean
+            dst[k] = sqrt(abs(centered) / Float64(valid - ddof))
+
+
+def rolling_moments_vector[W: Int](
+    values: FPtr,
+    dst: FPtr,
+    rows: Int,
+    cols: Int,
+    col: Int,
+    window: Int,
+    minp: Int,
+    ddof: Int,
+    take_std: Bool,
+):
+    var zeros = SIMD[DType.float64, W](0.0)
+    var ones = SIMD[DType.float64, W](1.0)
+    var total = zeros
+    var total_sq = zeros
+    var count = zeros
+    for i in range(rows):
+        var value = values.load[width=W](i * cols + col)
+        var valid = value.eq(value)
+        var safe_value = valid.select(value, zeros)
+        total += safe_value
+        total_sq += safe_value * safe_value
+        count += valid.select(ones, zeros)
+        if i >= window:
+            var old = values.load[width=W]((i - window) * cols + col)
+            var old_valid = old.eq(old)
+            var safe_old = old_valid.select(old, zeros)
+            total -= safe_old
+            total_sq -= safe_old * safe_old
+            count -= old_valid.select(ones, zeros)
+        var result = total / count
+        if take_std:
+            var mean = total / count
+            var centered = total_sq - 2.0 * total * mean + count * mean * mean
+            result = sqrt(abs(centered) / (count - Float64(ddof)))
+            result = count.le(Float64(ddof)).select(
+                SIMD[DType.float64, W](nan_value()), result
+            )
+        result = count.lt(Float64(minp)).select(
+            SIMD[DType.float64, W](nan_value()), result
+        )
+        dst.store(i * cols + col, result)
+
+
 def rolling_moments(
     values: FPtr,
     dst: FPtr,
@@ -73,44 +160,24 @@ def rolling_moments(
     ddof: Int,
     take_std: Bool,
 ):
-    for col in range(cols):
-        var total = 0.0
-        var mean = 0.0
-        var moment2 = 0.0
-        var valid = 0
-        for i in range(rows):
-            var value = values[i * cols + col]
-            if not isnan(value):
-                valid += 1
-                var delta = value - mean
-                mean += delta / Float64(valid)
-                moment2 += delta * (value - mean)
-                total += value
-            if i >= window:
-                var old = values[(i - window) * cols + col]
-                if not isnan(old):
-                    total -= old
-                    if valid == 1:
-                        mean = 0.0
-                        moment2 = 0.0
-                    else:
-                        var new_count = valid - 1
-                        var new_mean = (Float64(valid) * mean - old) / Float64(new_count)
-                        moment2 -= (old - mean) * (old - new_mean)
-                        mean = new_mean
-                    valid -= 1
-            var k = i * cols + col
-            if valid < minp:
-                dst[k] = nan_value()
-            elif not take_std:
-                dst[k] = total / Float64(valid)
-            elif valid <= ddof:
-                dst[k] = nan_value()
-            else:
-                var variance = moment2
-                if variance < 0.0:
-                    variance = 0.0
-                dst[k] = sqrt(variance / Float64(valid - ddof))
+    comptime W = simd_width_of[DType.float64]()
+    var vector_cols = cols // W
+
+    @parameter
+    def compute_vector(block: Int):
+        rolling_moments_vector[W](
+            values, dst, rows, cols, block * W, window, minp, ddof, take_std
+        )
+
+    if rows * cols >= PARALLEL_ROLLING_WORK and vector_cols > 1:
+        parallelize[compute_vector](vector_cols, vector_cols)
+    else:
+        for block in range(vector_cols):
+            compute_vector(block)
+    for col in range(vector_cols * W, cols):
+        rolling_moments_scalar(
+            values, dst, rows, cols, col, window, minp, ddof, take_std
+        )
 
 
 def rolling_extreme(
@@ -153,16 +220,73 @@ def rolling_extreme(
                 dst[k] = values[Int(queue[head]) * cols + col]
 
 
+def returns_column(
+    values: FPtr, init_values: FPtr, dst: FPtr, rows: Int, cols: Int, col: Int
+):
+    var input_value = init_values[col]
+    for i in range(rows):
+        var k = i * cols + col
+        var output_value = values[k]
+        dst[k] = get_return(input_value, output_value)
+        input_value = output_value
+
+
 def returns_transform(
     values: FPtr, init_values: FPtr, dst: FPtr, rows: Int, cols: Int
 ):
-    for col in range(cols):
-        var input_value = init_values[col]
+    comptime W = simd_width_of[DType.float64]()
+    var zeros = SIMD[DType.float64, W](0.0)
+    var positive_infinity = SIMD[DType.float64, W](infinity())
+    var col = 0
+    while col + W <= cols:
+        var input_value = init_values.load[width=W](col)
         for i in range(rows):
             var k = i * cols + col
-            var output_value = values[k]
-            dst[k] = get_return(input_value, output_value)
+            var output_value = values.load[width=W](k)
+            var raw = (output_value - input_value) / input_value
+            var result = raw
+            if not input_value.gt(0.0).reduce_and():
+                result = input_value.lt(0.0).select(-raw, raw)
+                if input_value.eq(0.0).reduce_or():
+                    var zero_result = output_value.gt(0.0).select(
+                        positive_infinity, -positive_infinity
+                    )
+                    zero_result = output_value.eq(0.0).select(zeros, zero_result)
+                    zero_result = output_value.ne(output_value).select(
+                        output_value, zero_result
+                    )
+                    result = input_value.eq(0.0).select(zero_result, result)
+            dst.store(k, result)
             input_value = output_value
+        col += W
+    while col < cols:
+        returns_column(values, init_values, dst, rows, cols, col)
+        col += 1
+
+
+def cumulative_column(
+    returns: FPtr,
+    dst: FPtr,
+    rows: Int,
+    cols: Int,
+    col: Int,
+    start_value: Float64,
+    drawdown: Bool,
+):
+    var cumulative = 1.0
+    var peak = 1.0
+    for i in range(rows):
+        var k = i * cols + col
+        if not isnan(returns[k]):
+            cumulative *= 1.0 + returns[k]
+        if i == 0 or cumulative > peak:
+            peak = cumulative
+        if drawdown:
+            dst[k] = cumulative / peak - 1.0
+        elif start_value == 0.0:
+            dst[k] = cumulative - 1.0
+        else:
+            dst[k] = cumulative * start_value
 
 
 def cumulative_transform(
@@ -173,21 +297,39 @@ def cumulative_transform(
     start_value: Float64,
     drawdown: Bool,
 ):
-    for col in range(cols):
-        var cumulative = 1.0
-        var peak = 1.0
+    @parameter
+    def compute_column(col: Int):
+        cumulative_column(
+            returns, dst, rows, cols, col, start_value, drawdown
+        )
+
+    if rows * cols >= PARALLEL_COLUMN_WORK and cols > 1:
+        parallelize[compute_column](cols, cols)
+        return
+    comptime W = simd_width_of[DType.float64]()
+    var ones = SIMD[DType.float64, W](1.0)
+    var col = 0
+    while col + W <= cols:
+        var cumulative = ones
+        var peak = ones
         for i in range(rows):
             var k = i * cols + col
-            if not isnan(returns[k]):
-                cumulative *= 1.0 + returns[k]
-            if i == 0 or cumulative > peak:
+            var value = returns.load[width=W](k)
+            cumulative *= value.eq(value).select(ones + value, ones)
+            if i == 0:
                 peak = cumulative
-            if drawdown:
-                dst[k] = cumulative / peak - 1.0
-            elif start_value == 0.0:
-                dst[k] = cumulative - 1.0
             else:
-                dst[k] = cumulative * start_value
+                peak = max(peak, cumulative)
+            var result = cumulative / peak - ones
+            if not drawdown:
+                result = cumulative - ones if start_value == 0.0 else cumulative * start_value
+            dst.store(k, result)
+        col += W
+    while col < cols:
+        cumulative_column(
+            returns, dst, rows, cols, col, start_value, drawdown
+        )
+        col += 1
 
 
 def nan_mean(values: FPtr, rows: Int, cols: Int, col: Int, offset: Float64 = 0.0) -> Float64:
@@ -725,10 +867,17 @@ def mvt_quantile_metric(
     var result = fp(dst)
     var source = fp(returns)
     var work = fp(scratch)
-    for col in range(cols):
+    @parameter
+    def compute_column(col: Int):
         result[col] = quantile_metric(
             source, work + col * rows, rows, cols, col, op, cutoff
         )
+
+    if rows >= PARALLEL_QUANTILE_ROWS and cols > 1:
+        parallelize[compute_column](cols, cols)
+    else:
+        for col in range(cols):
+            compute_column(col)
 
 
 @export("mvt_clean_signals")

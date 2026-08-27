@@ -52,6 +52,32 @@ def test_returns_from_equity_match_vectorbt():
     )
 
 
+def test_return_and_drawdown_simd_tails_match_vectorbt():
+    values = np.array(
+        [
+            [100.0, -100.0, 0.0, 50.0, 80.0],
+            [101.0, -99.0, 2.0, np.nan, 0.0],
+            [0.0, 0.0, -2.0, 55.0, 82.0],
+            [2.0, -1.0, 0.0, 56.0, 81.0],
+        ]
+    )
+    initial = np.array([100.0, -100.0, 0.0, 50.0, 80.0])
+    actual_returns = mojo_nb.returns_nb(values, initial)
+    expected_returns = vbt.returns.nb.returns_nb(values, initial)
+    assert np.allclose(actual_returns, expected_returns, equal_nan=True)
+
+    rng = np.random.default_rng(91)
+    returns = np.ascontiguousarray(rng.normal(0.0005, 0.018, size=(503, 5)))
+    returns[::71, 4] = np.nan
+    assert np.allclose(
+        mojo_nb.drawdown_nb(returns),
+        vbt.returns.nb.drawdown_nb(returns),
+        equal_nan=True,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+
 @pytest.mark.parametrize(
     "name,args",
     [
@@ -204,6 +230,18 @@ def test_value_at_risk_parallel_threshold_matches_vectorbt(rows):
     expected = vbt.returns.nb.value_at_risk_nb(returns, 0.137)
     assert np.allclose(
         actual, expected, equal_nan=True, rtol=2e-9, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("rows", [249_999, 250_000])
+def test_drawdown_parallel_threshold_matches_vectorbt(rows):
+    rng = np.random.default_rng(rows)
+    returns = np.ascontiguousarray(rng.normal(0.0002, 0.01, size=(rows, 4)))
+    returns[::10_007, 2] = np.nan
+    actual = mojo_nb.drawdown_nb(returns)
+    expected = vbt.returns.nb.drawdown_nb(returns)
+    assert np.allclose(
+        actual, expected, equal_nan=True, rtol=1e-12, atol=1e-12
     )
 
 

@@ -35,7 +35,8 @@ The parity tests exercise every function listed above directly against
 vectorbt 1.1.0 using identical arrays. Coverage includes NaNs, multi-column
 inputs, non-contiguous and integer inputs, window and `minp` combinations,
 `ddof`, equity crossing zero, simultaneous signals, quantile interpolation,
-SIMD tails, parallel quantiles, and empty-reduction behavior.
+SIMD tails, parallel rolling/drawdown/quantile thresholds, and empty-reduction
+behavior.
 
 This is not a port of vectorbt's pandas accessors, plotting, data downloaders,
 record classes, indicator factory, portfolio object, order simulator,
@@ -71,21 +72,24 @@ in both implementations.
 
 | case | mojo-vectorbt | vectorbt | result |
 | --- | ---: | ---: | ---: |
-| `rolling_mean_nb` (1M x 8, window 128) | 257.59 ms | 412.65 ms | 1.60x faster |
-| `rolling_std_nb` (1M x 8, window 128) | 173.55 ms | 400.03 ms | 2.31x faster |
-| `rolling_max_nb` (500k x 8, window 128) | 134.73 ms | 1205.36 ms | 8.95x faster |
-| `returns_nb` (2M x 4) | 94.73 ms | 122.89 ms | 1.30x faster |
-| `drawdown_nb` (2M x 4) | 140.91 ms | 264.35 ms | 1.88x faster |
-| `sharpe_ratio_nb` (4M x 4) | 32.84 ms | 211.74 ms | 6.45x faster |
-| `value_at_risk_nb` (500k x 4) | 28.59 ms | 61.69 ms | 2.16x faster |
-| `clean_enex_nb` (2M x 8) | 146.56 ms | 199.87 ms | 1.36x faster |
+| `rolling_mean_nb` (1M x 8, window 128) | 46.90 ms | 305.23 ms | 6.51x faster |
+| `rolling_std_nb` (1M x 8, window 128) | 60.60 ms | 415.26 ms | 6.85x faster |
+| `rolling_max_nb` (500k x 8, window 128) | 91.91 ms | 1173.72 ms | 12.77x faster |
+| `returns_nb` (2M x 4) | 31.85 ms | 122.06 ms | 3.83x faster |
+| `drawdown_nb` (2M x 4) | 41.00 ms | 161.69 ms | 3.94x faster |
+| `sharpe_ratio_nb` (4M x 4) | 26.97 ms | 136.68 ms | 5.07x faster |
+| `value_at_risk_nb` (500k x 4) | 21.90 ms | 52.02 ms | 2.38x faster |
+| `clean_enex_nb` (2M x 8) | 95.02 ms | 186.78 ms | 1.97x faster |
 
 The largest win is algorithmic: rolling min/max uses a monotonic deque and is
 linear in the number of values, while vectorbt 1.1.0 scans each full window.
-Sharpe ratio reduces contiguous columns with native-width SIMD and handles
-remaining columns with the scalar kernel. Quantile metrics use linear-time
-three-way selection instead of fully sorting each column; large matrices
-process independent columns in parallel, while small inputs stay serial.
+Rolling moments, equity returns, cumulative returns, drawdown, and Sharpe
+process contiguous columns with native-width SIMD and scalar column tails.
+Large rolling matrices process independent SIMD blocks in parallel, while
+large cumulative/drawdown matrices and quantiles parallelize independent
+columns; each path stays serial below its measured work threshold. Quantile
+metrics use linear-time three-way selection instead of fully sorting each
+column.
 
 There is no GPU path. These kernels have low arithmetic intensity: Sharpe is a
 two-pass memory-bound reduction, and quantile selection is branch-heavy with
