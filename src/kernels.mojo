@@ -1,6 +1,5 @@
 """Vectorized backtesting kernels exposed through a C ABI."""
 
-from std.algorithm import sync_parallelize
 from std.math import floor, isnan, sqrt
 from std.sys.info import simd_width_of
 
@@ -726,17 +725,10 @@ def mvt_quantile_metric(
     var result = fp(dst)
     var source = fp(returns)
     var work = fp(scratch)
-    @parameter
-    def process_column(col: Int):
+    for col in range(cols):
         result[col] = quantile_metric(
             source, work + col * rows, rows, cols, col, op, cutoff
         )
-
-    if rows * cols >= 32768 and cols > 1:
-        sync_parallelize[process_column](cols)
-    else:
-        for col in range(cols):
-            process_column(col)
 
 
 @export("mvt_clean_signals")
