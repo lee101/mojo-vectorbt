@@ -1,15 +1,12 @@
 """Vectorized backtesting kernels exposed through a C ABI."""
 
-from max.algorithm import parallelize
 from std.math import floor, isnan, sqrt
 from std.sys.info import simd_width_of
 
 comptime FPtr = UnsafePointer[Float64, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int64, AnyOrigin[mut=True]]
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
-comptime PARALLEL_ROLLING_WORK = 1_000_000
-comptime PARALLEL_QUANTILE_ROWS = 8192
-comptime PARALLEL_COLUMN_WORK = 1_000_000
+comptime COLUMN_WORK = 1_000_000
 
 
 def fp(addr: Int) -> FPtr:
@@ -123,14 +120,14 @@ def rolling_moments_vector[W: Int](
     var total_sq = zeros
     var count = zeros
     for i in range(rows):
-        var value = values.load[width=W](i * cols + col)
+        var value = values.unsafe_load[width=W](i * cols + col)
         var valid = value.eq(value)
         var safe_value = valid.select(value, zeros)
         total += safe_value
         total_sq += safe_value * safe_value
         count += valid.select(ones, zeros)
         if i >= window:
-            var old = values.load[width=W]((i - window) * cols + col)
+            var old = values.unsafe_load[width=W]((i - window) * cols + col)
             var old_valid = old.eq(old)
             var safe_old = old_valid.select(old, zeros)
             total -= safe_old
@@ -163,17 +160,10 @@ def rolling_moments(
     comptime W = simd_width_of[DType.float64]()
     var vector_cols = cols // W
 
-    @parameter
-    def compute_vector(block: Int):
+    for block in range(vector_cols):
         rolling_moments_vector[W](
             values, dst, rows, cols, block * W, window, minp, ddof, take_std
         )
-
-    if rows * cols >= PARALLEL_ROLLING_WORK and vector_cols > 1:
-        parallelize[compute_vector](vector_cols, vector_cols)
-    else:
-        for block in range(vector_cols):
-            compute_vector(block)
     for col in range(vector_cols * W, cols):
         rolling_moments_scalar(
             values, dst, rows, cols, col, window, minp, ddof, take_std
@@ -239,10 +229,10 @@ def returns_transform(
     var positive_infinity = SIMD[DType.float64, W](infinity())
     var col = 0
     while col + W <= cols:
-        var input_value = init_values.load[width=W](col)
+        var input_value = init_values.unsafe_load[width=W](col)
         for i in range(rows):
             var k = i * cols + col
-            var output_value = values.load[width=W](k)
+            var output_value = values.unsafe_load[width=W](k)
             var raw = (output_value - input_value) / input_value
             var result = raw
             if not input_value.gt(0.0).reduce_and():
@@ -297,14 +287,11 @@ def cumulative_transform(
     start_value: Float64,
     drawdown: Bool,
 ):
-    @parameter
-    def compute_column(col: Int):
-        cumulative_column(
-            returns, dst, rows, cols, col, start_value, drawdown
-        )
-
-    if rows * cols >= PARALLEL_COLUMN_WORK and cols > 1:
-        parallelize[compute_column](cols, cols)
+    if rows * cols >= COLUMN_WORK and cols > 1:
+        for col in range(cols):
+            cumulative_column(
+                returns, dst, rows, cols, col, start_value, drawdown
+            )
         return
     comptime W = simd_width_of[DType.float64]()
     var ones = SIMD[DType.float64, W](1.0)
@@ -314,7 +301,7 @@ def cumulative_transform(
         var peak = ones
         for i in range(rows):
             var k = i * cols + col
-            var value = returns.load[width=W](k)
+            var value = returns.unsafe_load[width=W](k)
             cumulative *= value.eq(value).select(ones + value, ones)
             if i == 0:
                 peak = cumulative
@@ -382,7 +369,7 @@ def sharpe_ratio_matrix(
         var total = SIMD[DType.float64, W](0.0)
         var count = SIMD[DType.float64, W](0.0)
         for i in range(rows):
-            var value = returns.load[width=W](i * cols + col)
+            var value = returns.unsafe_load[width=W](i * cols + col)
             var valid = value.eq(value)
             total += valid.select(value - risk_free, SIMD[DType.float64, W](0.0))
             count += valid.select(
@@ -391,7 +378,7 @@ def sharpe_ratio_matrix(
         var mean = total / count
         var moment2 = SIMD[DType.float64, W](0.0)
         for i in range(rows):
-            var value = returns.load[width=W](i * cols + col)
+            var value = returns.unsafe_load[width=W](i * cols + col)
             var valid = value.eq(value)
             var delta = value - risk_free - mean
             moment2 += valid.select(
@@ -867,17 +854,10 @@ def mvt_quantile_metric(
     var result = fp(dst)
     var source = fp(returns)
     var work = fp(scratch)
-    @parameter
-    def compute_column(col: Int):
+    for col in range(cols):
         result[col] = quantile_metric(
             source, work + col * rows, rows, cols, col, op, cutoff
         )
-
-    if rows >= PARALLEL_QUANTILE_ROWS and cols > 1:
-        parallelize[compute_column](cols, cols)
-    else:
-        for col in range(cols):
-            compute_column(col)
 
 
 @export("mvt_clean_signals")
